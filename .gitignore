@@ -1,4 +1,5 @@
 /__pycache__
+/sim
 train.csv
 test.csv
 predictions.csv
