@@ -34,8 +34,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SEED = 42
 N_FOLDS = 5
 Y_MIN, Y_MAX = 0.1, 140.7
-TIME_BUDGET_S = 420          # stop adding OOF work after this (limit is 600 s)
-N_THREADS = max(1, min(4, os.cpu_count() or 1))
+TIME_BUDGET_S = 420          # don't start a new model after this (limit is 600 s)
+HARD_LIMIT_S = 540           # skip a model if its estimated finish would pass this
+
+
+def _usable_cpus() -> int:
+    try:  # respects container/affinity limits on Linux (os.cpu_count() reports the host)
+        return len(os.sched_getaffinity(0))
+    except Exception:  # noqa: BLE001
+        return os.cpu_count() or 1
+
+
+N_THREADS = max(1, min(4, int(os.environ.get("HD_THREADS", 0)) or _usable_cpus()))
 USE_GROUP_AGGS = False      # train+test group stats: no CV gain in our ablation (0.667 vs 0.669)
 
 LABELS = ["hours_spent", "log_hours", "hours_bucket"]
@@ -257,9 +267,11 @@ def make_models(cat_names, cat_vocab):
             for c in cat_names:
                 Xtr[c] = Xtr[c].astype(str)
                 Xte[c] = Xte[c].astype(str)
-            # 600 iters @ lr 0.08 ~ same quality as 1500 @ 0.04, ~2.5x faster (keeps 6 fits < 10 min)
+            # one-hot cats instead of CTRs: 4x faster (11 vs 45 s/fit) and same 10-fold OOF
+            # (0.6652 vs 0.6674). 600 iters @ lr 0.08 ~ 1500 @ 0.04.
             m = CatBoostRegressor(
                 loss_function="RMSE", iterations=600, learning_rate=0.08, depth=6,
+                one_hot_max_size=255,
                 l2_leaf_reg=5, random_strength=1.0, bootstrap_type="Bernoulli",
                 subsample=0.8, random_seed=SEED, thread_count=N_THREADS, verbose=0,
                 allow_writing_files=False)
@@ -326,7 +338,10 @@ def make_models(cat_names, cat_vocab):
         m.fit(xa, ytr)
         return m.predict(xb)
     models.append(("ridge", fit_ridge))
-    return models
+    # run cheap / high-blend-weight models first so a slow server only drops the tail.
+    # xgboost is last: it consistently gets blend weight 0 (overlaps lightgbm).
+    order = ["ridge", "hgb", "extratrees", "lgbm", "catboost", "xgboost"]
+    return sorted(models, key=lambda m: order.index(m[0]) if m[0] in order else len(order))
 
 
 def to_codes_fixed(X: pd.DataFrame, cat_names, cat_vocab) -> pd.DataFrame:
@@ -374,6 +389,10 @@ def main() -> None:
     train = train[train["hours_spent"].notna()].reset_index(drop=True)
     y = np.log1p(train["hours_spent"].clip(Y_MIN, Y_MAX).values.astype(float))
     fallback = float(np.expm1(np.mean(y)))
+    out_path = os.path.join(HERE, "predictions.csv")
+    # write a constant file first: if the run is killed later, a valid file still exists
+    pd.DataFrame({"project_id": test["project_id"].astype(str),
+                  "hours_spent": round(fallback, 3)}).to_csv(out_path, index=False)
 
     try:
         Xtr, Xte, cat_names = build_features(train, test)
@@ -385,13 +404,18 @@ def main() -> None:
         oof, test_preds, names = [], [], []
         for name, fn in models:
             ts = time.time()
+            # a model without OOF would get blend weight 0, so skip it entirely when late
+            if ts - t0 > TIME_BUDGET_S:
+                log(f"{name}: skipped, time budget used ({ts - t0:.0f}s)")
+                continue
             try:
                 o = np.zeros(len(y))
-                if time.time() - t0 < TIME_BUDGET_S:
-                    for tr_idx, va_idx in folds:
-                        o[va_idx] = fn(Xtr.iloc[tr_idx], y[tr_idx], Xtr.iloc[va_idx])
-                else:
-                    o[:] = np.nan  # out of time: no OOF, still fit full model
+                for k, (tr_idx, va_idx) in enumerate(folds):
+                    o[va_idx] = fn(Xtr.iloc[tr_idx], y[tr_idx], Xtr.iloc[va_idx])
+                    per_fit = (time.time() - ts) / (k + 1)
+                    # remaining folds + full fit (~1.25x a fold fit) must finish in time
+                    if time.time() - t0 + per_fit * (N_FOLDS - k - 1 + 1.25) > HARD_LIMIT_S:
+                        raise TimeoutError(f"would exceed {HARD_LIMIT_S}s (~{per_fit:.0f}s/fit)")
                 p = fn(Xtr, y, Xte)
                 if not np.all(np.isfinite(p)):
                     raise ValueError("non-finite predictions")
@@ -420,7 +444,7 @@ def main() -> None:
 
     pred = np.where(np.isfinite(pred), pred, fallback)
     pd.DataFrame({"project_id": test["project_id"].astype(str),
-                  "hours_spent": np.round(pred, 3)}).to_csv(os.path.join(HERE, "predictions.csv"), index=False)
+                  "hours_spent": np.round(pred, 3)}).to_csv(out_path, index=False)
     log(f"wrote predictions.csv ({len(test)} rows) in {time.time() - t0:.1f}s")
 
 
