@@ -1,0 +1,3 @@
+# predict.py uses only the preinstalled packages
+# (pandas, numpy, scikit-learn, scipy, lightgbm, xgboost, catboost).
+# Nothing to install on the scoring server.
