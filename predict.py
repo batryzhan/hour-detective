@@ -257,8 +257,9 @@ def make_models(cat_names, cat_vocab):
             for c in cat_names:
                 Xtr[c] = Xtr[c].astype(str)
                 Xte[c] = Xte[c].astype(str)
+            # 600 iters @ lr 0.08 ~ same quality as 1500 @ 0.04, ~2.5x faster (keeps 6 fits < 10 min)
             m = CatBoostRegressor(
-                loss_function="RMSE", iterations=1500, learning_rate=0.04, depth=6,
+                loss_function="RMSE", iterations=600, learning_rate=0.08, depth=6,
                 l2_leaf_reg=5, random_strength=1.0, bootstrap_type="Bernoulli",
                 subsample=0.8, random_seed=SEED, thread_count=N_THREADS, verbose=0,
                 allow_writing_files=False)
